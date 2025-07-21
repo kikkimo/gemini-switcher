@@ -1,0 +1,56 @@
+{
+  "name": "@kikkimo/gemini-switcher",
+  "version": "1.0.0",
+  "description": "Interactive environment variable switcher for Google Gemini API with beautiful Gemini-style interface",
+  "main": "gemini-switcher",
+  "bin": {
+    "gemini-switcher": "./gemini-switcher"
+  },
+  "scripts": {
+    "start": "node gemini-switcher",
+    "test": "echo \"No tests specified\" && exit 0",
+    "prepublishOnly": "echo \"Publishing gemini-switcher...\"",
+    "postinstall": "echo \"Gemini Switcher installed successfully! Run 'gemini-switcher' to start.\"",
+    "publish:public": "npm publish --access public"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "gemini-switcher",
+    "gemini-switcher-template.env",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "docs/"
+  ],
+  "keywords": [
+    "gemini",
+    "google-gemini",
+    "api-key",
+    "switcher",
+    "environment",
+    "cli",
+    "interactive",
+    "menu",
+    "windows",
+    "kikkimo"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kikkimo/gemini-switcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kikkimo/gemini-switcher/issues"
+  },
+  "homepage": "https://github.com/kikkimo/gemini-switcher#readme",
+  "author": "kikkimo <fywhu@qq.com>",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "preferGlobal": true,
+  "os": [
+    "win32"
+  ]
+}

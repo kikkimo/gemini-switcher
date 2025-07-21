@@ -1,0 +1,1342 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+const crypto = require('crypto');
+const os = require('os');
+const { spawn } = require('child_process');
+
+// ANSI color codes for Gemini-style theming
+const colors = {
+    reset: '\x1b[0m',
+    bright: '\x1b[1m',
+    blue: '\x1b[38;5;33m',
+    red: '\x1b[38;5;219m',
+    yellow: '\x1b[38;5;226m',
+    green: '\x1b[38;5;34m',
+    white: '\x1b[37m',
+    gray: '\x1b[90m',
+    black: '\x1b[30m',
+    bgBlue: '\x1b[48;5;33m'
+};
+
+// Configuration file path
+function getConfigPath() {
+    return path.join(os.homedir(), '.gemini-switcher.json');
+}
+
+const CONFIG_FILE = getConfigPath();
+
+// Generate encryption key from machine-specific data
+function getEncryptionKey() {
+    const machineId = os.hostname() + os.userInfo().username + os.platform();
+    return crypto.pbkdf2Sync(machineId, 'gemini-switcher-salt', 10000, 32, 'sha256');
+}
+
+// Encrypt data using AES-256-CBC
+function encryptData(plaintext) {
+    try {
+        const key = getEncryptionKey();
+        const iv = crypto.randomBytes(16);
+        const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+        
+        let encrypted = cipher.update(plaintext, 'utf8', 'hex');
+        encrypted += cipher.final('hex');
+        
+        const result = iv.toString('hex') + ':' + encrypted;
+        return { success: true, value: result, error: null };
+    } catch (error) {
+        return { success: false, value: null, error: error.message };
+    }
+}
+
+// Decrypt data using AES-256-CBC
+function decryptData(encryptedData) {
+    try {
+        const key = getEncryptionKey();
+        const parts = encryptedData.split(':');
+        if (parts.length !== 2) {
+            throw new Error('Invalid encrypted data format');
+        }
+        
+        const iv = Buffer.from(parts[0], 'hex');
+        const encrypted = parts[1];
+        
+        const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        
+        return { success: true, value: decrypted, error: null };
+    } catch (error) {
+        return { success: false, value: null, error: error.message };
+    }
+}
+
+// Configuration management
+class ConfigManager {
+    constructor() {
+        this.config = this.loadConfig();
+    }
+
+    loadConfig() {
+        try {
+            if (fs.existsSync(CONFIG_FILE)) {
+                const encryptedData = fs.readFileSync(CONFIG_FILE, 'utf8');
+                const decrypted = decryptData(encryptedData);
+                if (decrypted.success) {
+                    return JSON.parse(decrypted.value);
+                }
+            }
+        } catch (error) {
+            console.log(colors.yellow + `[!] Could not load config: ${error.message}` + colors.reset);
+        }
+        
+        return { authentications: [], activeIndex: -1 };
+    }
+
+    saveConfig() {
+        try {
+            const configJson = JSON.stringify(this.config, null, 2);
+            const encrypted = encryptData(configJson);
+            if (encrypted.success) {
+                fs.writeFileSync(CONFIG_FILE, encrypted.value);
+            } else {
+                console.log(colors.red + `[!] Failed to save config: ${encrypted.error}` + colors.reset);
+            }
+        } catch (error) {
+            console.log(colors.red + `[!] Error saving config: ${error.message}` + colors.reset);
+        }
+    }
+
+    checkDuplicate(apiKey, projectId) {
+        const existing = this.config.authentications.find(auth => 
+            auth.apiKey === apiKey || auth.projectId === projectId
+        );
+        
+        if (existing) {
+            if (existing.apiKey === apiKey) {
+                return { isDuplicate: true, type: 'API Key', existing };
+            } else if (existing.projectId === projectId) {
+                return { isDuplicate: true, type: 'Project ID', existing };
+            }
+        }
+        
+        return { isDuplicate: false };
+    }
+
+    addAuthentication(apiKey, projectId) {
+        const duplicateCheck = this.checkDuplicate(apiKey, projectId);
+        if (duplicateCheck.isDuplicate) {
+            return {
+                success: false,
+                error: `${duplicateCheck.type} already exists`,
+                existingAuth: duplicateCheck.existing
+            };
+        }
+        
+        this.config.authentications.push({
+            apiKey,
+            projectId,
+            id: Date.now().toString()
+        });
+        this.saveConfig();
+        
+        return { success: true };
+    }
+
+    removeAuthentication(index) {
+        if (index >= 0 && index < this.config.authentications.length) {
+            this.config.authentications.splice(index, 1);
+            if (this.config.activeIndex >= this.config.authentications.length) {
+                this.config.activeIndex = this.config.authentications.length - 1;
+            }
+            this.saveConfig();
+            return true;
+        }
+        return false;
+    }
+
+    getAuthentications() {
+        return this.config.authentications;
+    }
+
+    setActiveAuthentication(index) {
+        if (index >= 0 && index < this.config.authentications.length) {
+            this.config.activeIndex = index;
+            this.saveConfig();
+            return this.config.authentications[index];
+        }
+        return null;
+    }
+
+    getActiveAuthentication() {
+        if (this.config.activeIndex >= 0 && this.config.activeIndex < this.config.authentications.length) {
+            return this.config.authentications[this.config.activeIndex];
+        }
+        return null;
+    }
+}
+
+const configManager = new ConfigManager();
+
+// Validation functions
+function validateApiKey(apiKey) {
+    if (!apiKey || apiKey.trim() === '') {
+        return { valid: false, error: 'API key is empty or missing' };
+    }
+    if (apiKey.length < 20) {
+        return { valid: false, error: 'API key must be at least 20 characters long' };
+    }
+    return { valid: true, error: null, value: apiKey.trim() };
+}
+
+function validateProjectId(projectId) {
+    if (!projectId || projectId.trim() === '') {
+        return { valid: false, error: 'Project ID is empty or missing' };
+    }
+    if (projectId.length < 6) {
+        return { valid: false, error: 'Project ID must be at least 6 characters long' };
+    }
+    return { valid: true, error: null, value: projectId.trim() };
+}
+
+// Mask sensitive data
+function maskApiKey(apiKey) {
+    if (apiKey.length <= 28) return apiKey.replace(/.(?=.{4})/g, '*');
+    const prefix = apiKey.substring(0, 16);
+    const suffix = apiKey.substring(apiKey.length - 12);
+    return `${prefix}${'*'.repeat(Math.max(0, apiKey.length - 28))}${suffix}`;
+}
+
+function maskProjectId(projectId) {
+    if (projectId.length <= 8) return projectId.replace(/.(?=.{3})/g, '*');
+    const prefix = projectId.substring(0, 5);
+    const suffix = projectId.substring(projectId.length - 3);
+    return `${prefix}${'*'.repeat(Math.max(0, projectId.length - 8))}${suffix}`;
+}
+
+// Simple input using readline (supports paste naturally) like claude-launcher
+function simpleInput(prompt, showEscapeHint = true) {
+    return new Promise((resolve, reject) => {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+        
+        // Display escape hint if enabled
+        if (showEscapeHint) {
+            console.log(colors.gray + '  (Type "exit", "quit", or press Ctrl+C to cancel)' + colors.reset);
+        }
+        
+        rl.question(prompt, (answer) => {
+            const trimmedAnswer = answer.trim();
+            rl.close();
+            
+            // Always check for exit commands (not dependent on showEscapeHint)
+            if (trimmedAnswer.toLowerCase() === 'exit' || 
+                trimmedAnswer.toLowerCase() === 'quit' || 
+                trimmedAnswer.toLowerCase() === 'cancel') {
+                reject(new Error('USER_CANCELLED'));
+                return;
+            }
+            
+            resolve(trimmedAnswer);
+        });
+        
+        // Handle Ctrl+C
+        rl.on('SIGINT', () => {
+            rl.close();
+            reject(new Error('USER_CANCELLED'));
+        });
+    });
+}
+
+// Current state
+let currentMenu = 'main';
+let selectedIndex = 0;
+
+// Menu options
+const mainMenuOptions = [
+    'Add New Gemini Authentication',
+    'Remove Gemini Authentication',
+    'Switch Gemini Authentication', 
+    'Exit'
+];
+
+// Display functions
+function displayHeader() {
+    console.clear();
+    console.log('');
+    console.log(colors.blue + '  ┌────────────────────────────────────────┐' + colors.reset);
+    console.log(colors.blue + '  │' + colors.white + colors.bright + '       Gemini Environment Switcher      ' + colors.reset + colors.blue + '│' + colors.reset);
+    console.log(colors.blue + '  └────────────────────────────────────────┘' + colors.reset);
+    console.log('');
+    console.log(colors.gray + '  Use ↑↓ arrow keys to navigate, Enter to select' + colors.reset);
+    console.log('');
+}
+
+function displayMenu() {
+    displayHeader();
+    
+    mainMenuOptions.forEach((option, index) => {
+        if (index === selectedIndex) {
+            console.log(colors.blue + '  → ' + colors.black + colors.bgBlue + option + colors.reset);
+        } else {
+            console.log(colors.gray + '    ' + option + colors.reset);
+        }
+    });
+    console.log('');
+}
+
+// Handle key press
+function handleKeyPress(key) {
+    switch (key) {
+        case '\u001b[A': // Up arrow
+            selectedIndex = (selectedIndex - 1 + mainMenuOptions.length) % mainMenuOptions.length;
+            displayMenu();
+            break;
+            
+        case '\u001b[B': // Down arrow
+            selectedIndex = (selectedIndex + 1) % mainMenuOptions.length;
+            displayMenu();
+            break;
+            
+        case '\r': // Enter
+            executeSelection();
+            break;
+            
+        case '\u001b': // Escape
+        case 'q':
+        case 'Q':
+            console.log('');
+            console.log(colors.green + 'Goodbye!' + colors.reset);
+            process.exit(0);
+            break;
+    }
+}
+
+// Execute selected menu item
+async function executeSelection() {
+    // Clean up stdin listeners before executing async functions
+    if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+        process.stdin.removeAllListeners('data');
+        process.stdin.pause();
+    }
+    
+    switch (selectedIndex) {
+        case 0: // Add New Gemini Authentication
+            await addNewAuthentication();
+            break;
+            
+        case 1: // Remove Gemini Authentication
+            await removeAuthentication();
+            break;
+            
+        case 2: // Switch Gemini Authentication
+            await switchAuthentication();
+            break;
+            
+        case 3: // Exit
+            await exitWithEnvironmentSetup();
+            break;
+            
+    }
+    
+    // Return to menu after async operation
+    showMenu();
+}
+
+// Prompt user to input credentials with detailed information
+async function promptForCredentials() {
+    try {
+        console.clear();
+        console.log('');
+        console.log(colors.bright + colors.blue + '[*] Gemini API Credentials Setup' + colors.reset);
+        console.log('');
+        console.log(colors.yellow + '[!] This message appears because you need to add new Gemini API credentials.' + colors.reset);
+        console.log('');
+        console.log(colors.yellow + '[?] Why do you need to enter these credentials?' + colors.reset);
+        console.log(colors.gray + '   • Gemini API requires both API key and Google Cloud Project ID' + colors.reset);
+        console.log(colors.gray + '   • These credentials enable access to Google\'s Gemini AI services' + colors.reset);
+        console.log(colors.bright + colors.green + '   • Credentials will be encrypted and stored locally' + colors.reset);
+        console.log(colors.bright + colors.green + '   • Only accessible on this machine' + colors.reset);
+        console.log('');
+        console.log(colors.yellow + '[!] Security:' + colors.reset);
+        console.log(colors.gray + '   • Credentials are encrypted using AES-256-CBC' + colors.reset);
+        console.log(colors.gray + '   • Encryption key derived from machine-specific data' + colors.reset);
+        console.log(colors.gray + '   • Keys cannot be decrypted on other machines' + colors.reset);
+        console.log('');
+        
+        // Show input box for API Key
+        console.log(colors.blue + '┌─────────────────────────────────────────────────────────┐' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.bright + 'Enter your Gemini API Key' + '                              ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '├─────────────────────────────────────────────────────────┤' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.gray + 'Format: AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' + '     ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.gray + 'You can copy and paste your API key here' + '               ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.bright + colors.yellow + 'After entering, press ENTER to continue' + '                ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.gray + 'Type "exit" or "quit" to return to menu' + '                ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '└─────────────────────────────────────────────────────────┘' + colors.reset);
+        console.log('');
+        
+        // Input loop for API Key
+        let apiKey;
+        let showApiKeyHint = true;
+        while (true) {
+            try {
+                const apiKeyInput = await simpleInput(colors.green + '[>] API Key (press ENTER after input): ' + colors.reset, showApiKeyHint);
+                showApiKeyHint = false; // Only show escape hint on first input
+                
+                // Validate the entered API key
+                const validation = validateApiKey(apiKeyInput);
+                
+                if (!validation.valid) {
+                    console.log(colors.red + '[X] Invalid API key: ' + validation.error + colors.reset);
+                    console.log(colors.yellow + '[!] Please try again with a valid API key.' + colors.reset);
+                    console.log('');
+                    continue;
+                }
+                
+                // Check for duplicates
+                const duplicateCheck = configManager.checkDuplicate(validation.value, '');
+                if (duplicateCheck.isDuplicate && duplicateCheck.type === 'API Key') {
+                    console.log(colors.red + '[X] This API key already exists!' + colors.reset);
+                    console.log(colors.gray + `    Existing: ${maskApiKey(duplicateCheck.existing.apiKey)} | ${maskProjectId(duplicateCheck.existing.projectId)}` + colors.reset);
+                    console.log(colors.yellow + '[!] Please enter a different API key.' + colors.reset);
+                    console.log('');
+                    continue;
+                }
+                
+                apiKey = validation.value;
+                break;
+                
+            } catch (error) {
+                if (error.message === 'USER_CANCELLED') {
+                    console.log('');
+                    console.log(colors.yellow + '[!] Setup cancelled by user.' + colors.reset);
+                    return null; // Return null instead of throwing
+                }
+                throw error; // Re-throw other errors
+            }
+        }
+        
+        console.log('');
+        console.log(colors.green + '[+] API Key validation successful!' + colors.reset);
+        console.log('');
+        
+        // Show input box for Project ID
+        console.log(colors.blue + '┌─────────────────────────────────────────────────────────┐' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.bright + 'Enter your Google Cloud Project ID' + '                     ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '├─────────────────────────────────────────────────────────┤' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.gray + 'Format: my-project-123456' + '                              ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.gray + 'This is your Google Cloud Project identifier' + '           ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.bright + colors.yellow + 'After entering, press ENTER to continue' + '                ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '│' + colors.reset + '  ' + colors.gray + 'Type "exit" or "quit" to return to menu' + '                ' + colors.reset + colors.blue + '│' + colors.reset);
+        console.log(colors.blue + '└─────────────────────────────────────────────────────────┘' + colors.reset);
+        console.log('');
+        
+        // Input loop for Project ID
+        let projectId;
+        let showProjectIdHint = true;
+        while (true) {
+            try {
+                const projectIdInput = await simpleInput(colors.green + '[>] Project ID (press ENTER after input): ' + colors.reset, showProjectIdHint);
+                showProjectIdHint = false; // Only show escape hint on first input
+                
+                // Validate the entered Project ID
+                const validation = validateProjectId(projectIdInput);
+                
+                if (!validation.valid) {
+                    console.log(colors.red + '[X] Invalid Project ID: ' + validation.error + colors.reset);
+                    console.log(colors.yellow + '[!] Please try again with a valid Project ID.' + colors.reset);
+                    console.log('');
+                    continue;
+                }
+                
+                // Check for duplicates
+                const duplicateCheck = configManager.checkDuplicate('', validation.value);
+                if (duplicateCheck.isDuplicate && duplicateCheck.type === 'Project ID') {
+                    console.log(colors.red + '[X] This Project ID already exists!' + colors.reset);
+                    console.log(colors.gray + `    Existing: ${maskApiKey(duplicateCheck.existing.apiKey)} | ${maskProjectId(duplicateCheck.existing.projectId)}` + colors.reset);
+                    console.log(colors.yellow + '[!] Please enter a different Project ID.' + colors.reset);
+                    console.log('');
+                    continue;
+                }
+                
+                projectId = validation.value;
+                break;
+                
+            } catch (error) {
+                if (error.message === 'USER_CANCELLED') {
+                    console.log('');
+                    console.log(colors.yellow + '[!] Setup cancelled by user.' + colors.reset);
+                    return null; // Return null instead of throwing
+                }
+                throw error; // Re-throw other errors
+            }
+        }
+        
+        console.log('');
+        console.log(colors.green + '[+] Project ID validation successful!' + colors.reset);
+        console.log('');
+        
+        return { apiKey, projectId };
+        
+    } catch (error) {
+        if (error.message !== 'USER_CANCELLED') {
+            console.log(colors.red + '[X] Setup failed: ' + error.message + colors.reset);
+        }
+        return null; // Return null for any error
+    }
+}
+
+// Core functions
+async function addNewAuthentication() {
+    const credentials = await promptForCredentials();
+    
+    if (!credentials) {
+        // User cancelled or error occurred
+        console.log(colors.yellow + '[!] Operation cancelled, returning to main menu...' + colors.reset);
+        return;
+    }
+    
+    try {
+        const result = configManager.addAuthentication(credentials.apiKey, credentials.projectId);
+        
+        if (result.success) {
+            console.clear();
+            displayHeader();
+            console.log(colors.green + '[+] Credentials encrypted and saved successfully!' + colors.reset);
+            console.log(colors.gray + '   Configuration saved to: ' + CONFIG_FILE + colors.reset);
+            console.log('');
+            console.log(colors.bright + colors.green + '[+] New Gemini authentication added successfully!' + colors.reset);
+            console.log(colors.gray + `    API Key: ${maskApiKey(credentials.apiKey)}` + colors.reset);
+            console.log(colors.gray + `    Project: ${maskProjectId(credentials.projectId)}` + colors.reset);
+        } else {
+            console.clear();
+            displayHeader();
+            console.log(colors.red + '[X] Failed to add authentication: ' + result.error + colors.reset);
+            if (result.existingAuth) {
+                console.log(colors.gray + `    Existing: ${maskApiKey(result.existingAuth.apiKey)} | ${maskProjectId(result.existingAuth.projectId)}` + colors.reset);
+            }
+        }
+    } catch (error) {
+        console.clear();
+        displayHeader();
+        console.log(colors.red + '[X] Unexpected error: ' + error.message + colors.reset);
+    }
+    
+    console.log('');
+    console.log(colors.gray + 'Press any key to return to main menu...' + colors.reset);
+    
+    // Wait for key press
+    await new Promise((resolve) => {
+        const keyHandler = () => {
+            process.stdin.removeListener('data', keyHandler);
+            resolve();
+        };
+        process.stdin.once('data', keyHandler);
+        process.stdin.resume();
+    });
+}
+
+// Set Windows environment variables
+function setWindowsEnvironmentVariable(name, value) {
+    try {
+        // Set for current process
+        process.env[name] = value;
+        
+        // Set for current user (persistent)
+        const setx = spawn('setx', [name, value], { stdio: 'inherit' });
+        
+        return new Promise((resolve, reject) => {
+            setx.on('close', (code) => {
+                if (code === 0) {
+                    resolve(true);
+                } else {
+                    reject(new Error(`Failed to set environment variable. Exit code: ${code}`));
+                }
+            });
+            
+            setx.on('error', (error) => {
+                reject(error);
+            });
+        });
+    } catch (error) {
+        throw error;
+    }
+}
+
+// Exit with environment variable setup
+async function exitWithEnvironmentSetup() {
+    console.clear();
+    displayHeader();
+    
+    // Read current system environment variables (set by Switch Authentication)
+    const currentApiKey = process.env.GEMINI_API_KEY;
+    const currentProjectId = process.env.GOOGLE_CLOUD_PROJECT;
+    
+    // Check if environment variables are already set
+    if (!currentApiKey || !currentProjectId) {
+        console.log(colors.yellow + '[!] No environment variables currently set' + colors.reset);
+        console.log(colors.gray + '    Please use "Switch Gemini Authentication" first to set environment variables.' + colors.reset);
+        console.log('');
+        console.log(colors.gray + 'Press any key to return to main menu...' + colors.reset);
+        
+        await new Promise((resolve) => {
+            const keyHandler = () => {
+                process.stdin.removeListener('data', keyHandler);
+                resolve();
+            };
+            process.stdin.once('data', keyHandler);
+            process.stdin.resume();
+        });
+        return;
+    }
+    
+    console.log(colors.green + '[+] Current environment variables for shell setup:' + colors.reset);
+    console.log('');
+    console.log(colors.yellow + 'Current Authentication:' + colors.reset);
+    console.log(colors.gray + `  API Key: ${maskApiKey(currentApiKey)}` + colors.reset);
+    console.log(colors.gray + `  Project: ${currentProjectId}` + colors.reset);
+    console.log('');
+    
+    // Detect shell type and generate appropriate commands
+    const shellType = detectShellType();
+    const commands = generateShellCommands(shellType, currentApiKey, currentProjectId);
+    
+    console.log(colors.yellow + `Detected Shell: ${shellType}` + colors.reset);
+    console.log('');
+    console.log(colors.bright + colors.green + 'Copy and run these commands in your shell:' + colors.reset);
+    console.log('');
+    
+    // Display commands in a box
+    const maxLength = Math.max(...commands.map(cmd => cmd.length));
+    const border = '─'.repeat(maxLength + 4);
+    
+    console.log(colors.blue + '┌' + border + '┐' + colors.reset);
+    commands.forEach(cmd => {
+        console.log(colors.blue + '│ ' + colors.bright + colors.white + cmd.padEnd(maxLength + 2) + colors.blue + ' │' + colors.reset);
+    });
+    console.log(colors.blue + '└' + border + '┘' + colors.reset);
+    
+    console.log('');
+    console.log(colors.gray + 'After running these commands, you can use:' + colors.reset);
+    console.log(colors.bright + colors.yellow + '  gemini' + colors.reset + colors.gray + ' - to start Gemini CLI' + colors.reset);
+    console.log('');
+    console.log(colors.green + 'Environment variables will be available in your current shell session.' + colors.reset);
+    console.log('');
+    console.log(colors.green + 'Goodbye!' + colors.reset);
+    
+    process.exit(0);
+}
+
+// Detect the current shell type
+function detectShellType() {
+    // Check environment variables that indicate shell type
+    if (process.env.PSModulePath) {
+        return 'PowerShell';
+    }
+    
+    // Check if we're in Windows CMD
+    if (process.platform === 'win32' && process.env.COMSPEC) {
+        if (process.env.COMSPEC.toLowerCase().includes('cmd.exe')) {
+            return 'CMD';
+        }
+    }
+    
+    // Check for common Unix shells
+    const shell = process.env.SHELL;
+    if (shell) {
+        if (shell.includes('bash')) {
+            return 'Bash';
+        } else if (shell.includes('zsh')) {
+            return 'Zsh';
+        } else if (shell.includes('fish')) {
+            return 'Fish';
+        } else if (shell.includes('sh')) {
+            return 'Shell';
+        }
+    }
+    
+    // Default based on platform
+    if (process.platform === 'win32') {
+        return 'CMD';
+    } else {
+        return 'Bash';
+    }
+}
+
+// Generate shell-specific environment variable commands
+function generateShellCommands(shellType, apiKey, projectId) {
+    switch (shellType) {
+        case 'PowerShell':
+            return [
+                `$env:GEMINI_API_KEY="${apiKey}"`,
+                `$env:GOOGLE_CLOUD_PROJECT="${projectId}"`
+            ];
+            
+        case 'CMD':
+            return [
+                `set GEMINI_API_KEY=${apiKey}`,
+                `set GOOGLE_CLOUD_PROJECT=${projectId}`
+            ];
+            
+        case 'Fish':
+            return [
+                `set -x GEMINI_API_KEY "${apiKey}"`,
+                `set -x GOOGLE_CLOUD_PROJECT "${projectId}"`
+            ];
+            
+        case 'Bash':
+        case 'Zsh':
+        case 'Shell':
+        default:
+            return [
+                `export GEMINI_API_KEY="${apiKey}"`,
+                `export GOOGLE_CLOUD_PROJECT="${projectId}"`
+            ];
+    }
+}
+
+// Authentication list navigation with keyboard support
+async function selectAuthenticationWithKeyboard(title, actionType = 'select') {
+    const authentications = configManager.getAuthentications();
+    if (authentications.length === 0) {
+        console.clear();
+        displayHeader();
+        console.log(colors.yellow + '[!] No authentications found' + colors.reset);
+        console.log(colors.gray + 'Press any key to continue...' + colors.reset);
+        await new Promise(resolve => process.stdin.once('data', resolve));
+        return null;
+    }
+    
+    let selectedAuthIndex = 0;
+    
+    function displayAuthList() {
+        console.clear();
+        displayHeader();
+        console.log(colors.yellow + title + colors.reset);
+        console.log('');
+        
+        authentications.forEach((auth, index) => {
+            const displayText = `${maskApiKey(auth.apiKey)} | ${maskProjectId(auth.projectId)}`;
+            if (index === selectedAuthIndex) {
+                console.log(colors.blue + '  → ' + colors.black + colors.bgBlue + displayText + colors.reset);
+            } else {
+                console.log(colors.gray + '    ' + displayText + colors.reset);
+            }
+        });
+        
+        console.log('');
+        if (actionType === 'remove') {
+            console.log(colors.gray + '  Use ↑↓ to navigate, Enter to select, ESC to cancel' + colors.reset);
+        } else {
+            console.log(colors.gray + '  Use ↑↓ to navigate, Enter to select, ESC to cancel' + colors.reset);
+        }
+        console.log('');
+    }
+    
+    function handleAuthListKeyPress(key) {
+        switch (key) {
+            case '\u001b[A': // Up arrow
+                selectedAuthIndex = (selectedAuthIndex - 1 + authentications.length) % authentications.length;
+                displayAuthList();
+                break;
+                
+            case '\u001b[B': // Down arrow
+                selectedAuthIndex = (selectedAuthIndex + 1) % authentications.length;
+                displayAuthList();
+                break;
+                
+            case '\r': // Enter
+                return authentications[selectedAuthIndex];
+                
+            case '\u001b': // Escape
+            case 'q':
+            case 'Q':
+                return null;
+        }
+        return undefined; // Continue listening
+    }
+    
+    return new Promise((resolve) => {
+        displayAuthList();
+        
+        if (process.stdin.isTTY) {
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.setEncoding('utf8');
+            process.stdin.removeAllListeners('data');
+            
+            const keyHandler = (key) => {
+                const result = handleAuthListKeyPress(key);
+                if (result !== undefined) {
+                    process.stdin.setRawMode(false);
+                    process.stdin.removeAllListeners('data');
+                    process.stdin.pause();
+                    resolve(result);
+                }
+            };
+            
+            process.stdin.on('data', keyHandler);
+        } else {
+            // Fallback for non-TTY
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout
+            });
+            
+            rl.question(colors.green + '[>] Select number (1-' + authentications.length + ') or "q" to cancel: ' + colors.reset, (input) => {
+                rl.close();
+                if (input.toLowerCase() === 'q' || input.toLowerCase() === 'quit') {
+                    resolve(null);
+                } else {
+                    const index = parseInt(input.trim()) - 1;
+                    if (index >= 0 && index < authentications.length) {
+                        resolve(authentications[index]);
+                    } else {
+                        resolve(null);
+                    }
+                }
+            });
+        }
+    });
+}
+
+// Remove authentication with continuous list view and ESC support
+async function removeAuthentication() {
+    while (true) {
+        // Ensure clean stdin state at the start of each loop iteration
+        if (process.stdin.isTTY) {
+            process.stdin.setRawMode(false);
+            process.stdin.removeAllListeners('data');
+            process.stdin.removeAllListeners('keypress');
+        }
+        
+        const authentications = configManager.getAuthentications();
+        
+        // Handle empty list case
+        if (authentications.length === 0) {
+            console.clear();
+            displayHeader();
+            console.log(colors.yellow + '[!] No authentications found' + colors.reset);
+            console.log(colors.gray + 'You need to add some authentications first.' + colors.reset);
+            console.log('');
+            console.log(colors.gray + 'Press any key to return to main menu...' + colors.reset);
+            
+            // Wait for key press
+            await new Promise((resolve) => {
+                const keyHandler = () => {
+                    process.stdin.removeListener('data', keyHandler);
+                    resolve();
+                };
+                process.stdin.once('data', keyHandler);
+                process.stdin.resume();
+            });
+            return;
+        }
+        
+        // Show list with table header and keyboard navigation
+        const selectedAuth = await showRemoveAuthenticationList(authentications);
+        
+        if (!selectedAuth) {
+            // User pressed ESC or cancelled, return to main menu
+            return;
+        }
+        
+        // Show confirmation dialog
+        const shouldDelete = await confirmDeletion(selectedAuth);
+        
+        if (shouldDelete) {
+            // Perform deletion
+            const index = authentications.findIndex(auth => auth.id === selectedAuth.id);
+            if (index >= 0) {
+                configManager.removeAuthentication(index);
+                console.log('');
+                console.log(colors.green + '[+] Authentication removed successfully!' + colors.reset);
+                
+                // Check if list is now empty
+                const remainingAuths = configManager.getAuthentications();
+                if (remainingAuths.length === 0) {
+                    console.log('');
+                    console.log(colors.yellow + '[!] All authentications have been removed.' + colors.reset);
+                    console.log(colors.gray + 'Press any key to return to main menu...' + colors.reset);
+                    
+                    // Wait for user acknowledgment and return to main menu
+                    await new Promise((resolve) => {
+                        const keyHandler = () => {
+                            process.stdin.removeListener('data', keyHandler);
+                            resolve();
+                        };
+                        process.stdin.once('data', keyHandler);
+                        process.stdin.resume();
+                    });
+                    return; // Exit the while loop and return to main menu
+                } else {
+                    console.log('');
+                    console.log(colors.gray + 'Press any key to continue selecting...' + colors.reset);
+                    
+                    // Wait for user acknowledgment
+                    await new Promise((resolve) => {
+                        const keyHandler = () => {
+                            process.stdin.removeListener('data', keyHandler);
+                            resolve();
+                        };
+                        process.stdin.once('data', keyHandler);
+                        process.stdin.resume();
+                    });
+                }
+            }
+        } else {
+            console.log('');
+            console.log(colors.yellow + '[!] Removal cancelled' + colors.reset);
+            console.log('');
+            console.log(colors.gray + 'Press any key to continue...' + colors.reset);
+            
+            // Wait for user acknowledgment
+            await new Promise((resolve) => {
+                const keyHandler = () => {
+                    process.stdin.removeListener('data', keyHandler);
+                    resolve();
+                };
+                process.stdin.once('data', keyHandler);
+                process.stdin.resume();
+            });
+        }
+        
+        // Continue the loop to show the updated list
+    }
+}
+
+// Display authentication list for removal with table header
+async function showRemoveAuthenticationList(authentications) {
+    let selectedIndex = 0;
+    
+    function displayRemoveList() {
+        console.clear();
+        displayHeader();
+        console.log(colors.yellow + '[!] Select authentication to remove:' + colors.reset);
+        console.log('');
+        
+        // Table header
+        console.log(colors.bright + colors.blue + 
+            '┌────┬─────────────────────────────────────────┬─────────────────────────────────┐' + colors.reset);
+        console.log(colors.bright + colors.blue + 
+            '│ #  │ Gemini API Key                          │   Google Cloud Project ID       │' + colors.reset);
+        console.log(colors.bright + colors.blue + 
+            '├────┼─────────────────────────────────────────┼─────────────────────────────────┤' + colors.reset);
+        
+        // List items
+        authentications.forEach((auth, index) => {
+            const num = (index + 1).toString().padStart(2, ' ');
+            const apiKey = maskApiKey(auth.apiKey).padEnd(35, ' ');
+            const projectId = maskProjectId(auth.projectId).padEnd(27, ' ');
+            
+            if (index === selectedIndex) {
+                // Selected item
+                console.log(colors.blue + '│' + colors.black + colors.bgBlue + 
+                    ` ${num} │ ${apiKey} │ ${projectId} ` + colors.reset + colors.blue + '    │' + colors.reset);
+            } else {
+                // Normal item
+                console.log(colors.blue + '│' + colors.gray + 
+                    ` ${num} │ ${apiKey} │ ${projectId} ` + colors.reset + colors.blue + '    │' + colors.reset);
+            }
+        });
+        
+        console.log(colors.bright + colors.blue + 
+            '└────┴─────────────────────────────────────────┴─────────────────────────────────┘' + colors.reset);
+        console.log('');
+        console.log(colors.gray + '  Use ↑↓ to navigate, Enter to select, ESC to return to main menu' + colors.reset);
+        console.log('');
+    }
+    
+    function handleRemoveListKeyPress(key) {
+        switch (key) {
+            case '\u001b[A': // Up arrow
+                selectedIndex = (selectedIndex - 1 + authentications.length) % authentications.length;
+                displayRemoveList();
+                break;
+                
+            case '\u001b[B': // Down arrow
+                selectedIndex = (selectedIndex + 1) % authentications.length;
+                displayRemoveList();
+                break;
+                
+            case '\r': // Enter
+                return authentications[selectedIndex];
+                
+            case '\u001b': // Escape
+            case 'q':
+            case 'Q':
+                return null;
+        }
+        return undefined; // Continue listening
+    }
+    
+    return new Promise((resolve) => {
+        displayRemoveList();
+        
+        if (process.stdin.isTTY) {
+            // Ensure clean state before setting up navigation
+            process.stdin.removeAllListeners('data');
+            process.stdin.removeAllListeners('keypress');
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.setEncoding('utf8');
+            
+            const keyHandler = (key) => {
+                const result = handleRemoveListKeyPress(key);
+                if (result !== undefined) {
+                    process.stdin.setRawMode(false);
+                    process.stdin.removeAllListeners('data');
+                    process.stdin.pause();
+                    resolve(result);
+                }
+            };
+            
+            process.stdin.on('data', keyHandler);
+        } else {
+            // Fallback for non-TTY
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout
+            });
+            
+            rl.question(colors.green + '[>] Select number (1-' + authentications.length + ') or "q" to cancel: ' + colors.reset, (input) => {
+                rl.close();
+                if (input.toLowerCase() === 'q' || input.toLowerCase() === 'quit') {
+                    resolve(null);
+                } else {
+                    const index = parseInt(input.trim()) - 1;
+                    if (index >= 0 && index < authentications.length) {
+                        resolve(authentications[index]);
+                    } else {
+                        resolve(null);
+                    }
+                }
+            });
+        }
+    });
+}
+
+// Show confirmation dialog for deletion
+async function confirmDeletion(auth) {
+    console.clear();
+    displayHeader();
+    console.log(colors.red + colors.bright + '[!] Confirm Deletion' + colors.reset);
+    console.log('');
+    console.log(colors.yellow + 'Are you sure you want to delete this authentication?' + colors.reset);
+    console.log(colors.gray + `    API Key: ${maskApiKey(auth.apiKey)}` + colors.reset);
+    console.log(colors.gray + `    Project: ${maskProjectId(auth.projectId)}` + colors.reset);
+    console.log('');
+    console.log(colors.red + 'This action cannot be undone!' + colors.reset);
+    console.log('');
+    
+    const confirm = await simpleInput(colors.red + '[?] Confirm deletion (y/N): ' + colors.reset, false);
+    
+    return confirm.toLowerCase() === 'y';
+}
+
+// Switch authentication and set Windows environment variables
+async function switchAuthentication() {
+    // Ensure clean stdin state
+    if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+        process.stdin.removeAllListeners('data');
+        process.stdin.removeAllListeners('keypress');
+    }
+    
+    const authentications = configManager.getAuthentications();
+    
+    // Handle empty list case
+    if (authentications.length === 0) {
+        console.clear();
+        displayHeader();
+        console.log(colors.yellow + '[!] No authentications found' + colors.reset);
+        console.log(colors.gray + 'You need to add some authentications first.' + colors.reset);
+        console.log('');
+        console.log(colors.gray + 'Press any key to return to main menu...' + colors.reset);
+        
+        // Wait for key press
+        await new Promise((resolve) => {
+            const keyHandler = () => {
+                process.stdin.removeListener('data', keyHandler);
+                resolve();
+            };
+            process.stdin.once('data', keyHandler);
+            process.stdin.resume();
+        });
+        return;
+    }
+    
+    // Show list with table header and keyboard navigation
+    const selectedAuth = await showSwitchAuthenticationList(authentications);
+    
+    if (!selectedAuth) {
+        // User pressed ESC or cancelled, return to main menu
+        return;
+    }
+    
+    // Switch authentication and set environment variables
+    await performAuthenticationSwitch(selectedAuth);
+}
+
+// Display authentication list for switching with table header
+async function showSwitchAuthenticationList(authentications) {
+    // Read current system environment variables
+    const currentApiKey = process.env.GEMINI_API_KEY;
+    const currentProjectId = process.env.GOOGLE_CLOUD_PROJECT;
+    
+    // Find matching authentication in the list
+    let selectedIndex = 0; // Default to first item
+    
+    if (currentApiKey && currentProjectId) {
+        const matchingIndex = authentications.findIndex(auth => 
+            auth.apiKey === currentApiKey && auth.projectId === currentProjectId
+        );
+        
+        if (matchingIndex >= 0) {
+            selectedIndex = matchingIndex;
+            console.log(colors.gray + `Found matching environment variables, selecting item #${matchingIndex + 1}` + colors.reset);
+        }
+    }
+    
+    function displaySwitchList() {
+        console.clear();
+        displayHeader();
+        console.log(colors.yellow + '[!] Select authentication to activate:' + colors.reset);
+        console.log('');
+        
+        // Show current environment variable status if available
+        if (currentApiKey && currentProjectId) {
+            console.log(colors.gray + 'Current environment variables:' + colors.reset);
+            console.log(colors.gray + `  GEMINI_API_KEY = ${maskApiKey(currentApiKey)}` + colors.reset);
+            console.log(colors.gray + `  GOOGLE_CLOUD_PROJECT = ${maskProjectId(currentProjectId)}` + colors.reset);
+            console.log('');
+        }
+        
+        // Table header (same format as remove function)
+        console.log(colors.bright + colors.blue + 
+            '┌────┬─────────────────────────────────────────┬─────────────────────────────────┐' + colors.reset);
+        console.log(colors.bright + colors.blue + 
+            '│ #  │ Gemini API Key                          │   Google Cloud Project ID       │' + colors.reset);
+        console.log(colors.bright + colors.blue + 
+            '├────┼─────────────────────────────────────────┼─────────────────────────────────┤' + colors.reset);
+        
+        // List items
+        authentications.forEach((auth, index) => {
+            const num = (index + 1).toString().padStart(2, ' ');
+            const apiKey = maskApiKey(auth.apiKey).padEnd(35, ' ');
+            const projectId = maskProjectId(auth.projectId).padEnd(27, ' ');
+            
+            // Check if this is the currently active authentication in environment
+            const isCurrentEnvAuth = currentApiKey && currentProjectId && 
+                                   auth.apiKey === currentApiKey && 
+                                   auth.projectId === currentProjectId;
+            
+            if (index === selectedIndex) {
+                // Selected item
+                const marker = isCurrentEnvAuth ? '●' : ' ';
+                console.log(colors.blue + '│' + colors.black + colors.bgBlue + 
+                    ` ${num} │ ${apiKey} │ ${projectId} ` + colors.reset + colors.blue + `${marker}   │` + colors.reset);
+            } else {
+                // Normal item
+                const marker = isCurrentEnvAuth ? colors.green + '●' + colors.reset : ' ';
+                console.log(colors.blue + '│' + colors.gray + 
+                    ` ${num} │ ${apiKey} │ ${projectId} ` + colors.reset + colors.blue + `${marker}   │` + colors.reset);
+            }
+        });
+        
+        console.log(colors.bright + colors.blue + 
+            '└────┴─────────────────────────────────────────┴─────────────────────────────────┘' + colors.reset);
+        console.log('');
+        if (currentApiKey && currentProjectId) {
+            console.log(colors.gray + '  ● = Currently active in environment variables' + colors.reset);
+        }
+        console.log(colors.gray + '  Use ↑↓ to navigate, Enter to activate, ESC to return to main menu' + colors.reset);
+        console.log('');
+    }
+    
+    function handleSwitchListKeyPress(key) {
+        switch (key) {
+            case '\u001b[A': // Up arrow
+                selectedIndex = (selectedIndex - 1 + authentications.length) % authentications.length;
+                displaySwitchList();
+                break;
+                
+            case '\u001b[B': // Down arrow
+                selectedIndex = (selectedIndex + 1) % authentications.length;
+                displaySwitchList();
+                break;
+                
+            case '\r': // Enter
+                return authentications[selectedIndex];
+                
+            case '\u001b': // Escape
+            case 'q':
+            case 'Q':
+                return null;
+        }
+        return undefined; // Continue listening
+    }
+    
+    return new Promise((resolve) => {
+        displaySwitchList();
+        
+        if (process.stdin.isTTY) {
+            // Ensure clean state before setting up navigation
+            process.stdin.removeAllListeners('data');
+            process.stdin.removeAllListeners('keypress');
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.setEncoding('utf8');
+            
+            const keyHandler = (key) => {
+                const result = handleSwitchListKeyPress(key);
+                if (result !== undefined) {
+                    process.stdin.setRawMode(false);
+                    process.stdin.removeAllListeners('data');
+                    process.stdin.pause();
+                    resolve(result);
+                }
+            };
+            
+            process.stdin.on('data', keyHandler);
+        } else {
+            // Fallback for non-TTY
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout
+            });
+            
+            rl.question(colors.green + '[>] Select number (1-' + authentications.length + ') or "q" to cancel: ' + colors.reset, (input) => {
+                rl.close();
+                if (input.toLowerCase() === 'q' || input.toLowerCase() === 'quit') {
+                    resolve(null);
+                } else {
+                    const index = parseInt(input.trim()) - 1;
+                    if (index >= 0 && index < authentications.length) {
+                        resolve(authentications[index]);
+                    } else {
+                        resolve(null);
+                    }
+                }
+            });
+        }
+    });
+}
+
+// Perform authentication switch and set Windows environment variables
+async function performAuthenticationSwitch(selectedAuth) {
+    console.clear();
+    displayHeader();
+    console.log(colors.yellow + '[!] Setting Windows environment variables...' + colors.reset);
+    console.log('');
+    console.log(colors.gray + `Selected authentication:` + colors.reset);
+    console.log(colors.gray + `    API Key: ${maskApiKey(selectedAuth.apiKey)}` + colors.reset);
+    console.log(colors.gray + `    Project: ${maskProjectId(selectedAuth.projectId)}` + colors.reset);
+    console.log('');
+    
+    try {
+        // Set GEMINI_API_KEY
+        console.log(colors.gray + 'Setting GEMINI_API_KEY...' + colors.reset);
+        await setWindowsEnvironmentVariable('GEMINI_API_KEY', selectedAuth.apiKey);
+        console.log(colors.green + '[+] GEMINI_API_KEY set successfully' + colors.reset);
+        
+        // Set GOOGLE_CLOUD_PROJECT
+        console.log(colors.gray + 'Setting GOOGLE_CLOUD_PROJECT...' + colors.reset);
+        await setWindowsEnvironmentVariable('GOOGLE_CLOUD_PROJECT', selectedAuth.projectId);
+        console.log(colors.green + '[+] GOOGLE_CLOUD_PROJECT set successfully' + colors.reset);
+        
+        // Update active authentication in config
+        const authentications = configManager.getAuthentications();
+        const index = authentications.findIndex(auth => auth.id === selectedAuth.id);
+        if (index >= 0) {
+            configManager.setActiveAuthentication(index);
+        }
+        
+        console.log('');
+        console.log(colors.bright + colors.green + '[+] Authentication activated and environment variables set!' + colors.reset);
+        console.log(colors.gray + `    GEMINI_API_KEY = ${maskApiKey(selectedAuth.apiKey)}` + colors.reset);
+        console.log(colors.gray + `    GOOGLE_CLOUD_PROJECT = ${maskProjectId(selectedAuth.projectId)}` + colors.reset);
+        console.log('');
+        console.log(colors.yellow + '[!] Environment variables have been set system-wide' + colors.reset);
+        console.log(colors.yellow + '[!] You may need to restart applications to use the new variables' + colors.reset);
+        
+    } catch (error) {
+        console.log('');
+        console.log(colors.red + '[X] Failed to set environment variables: ' + error.message + colors.reset);
+        console.log(colors.yellow + '[!] Make sure you are running as an administrator if needed' + colors.reset);
+    }
+    
+    console.log('');
+    console.log(colors.gray + 'Press any key to return to main menu...' + colors.reset);
+    
+    // Wait for key press
+    await new Promise((resolve) => {
+        const keyHandler = () => {
+            process.stdin.removeListener('data', keyHandler);
+            resolve();
+        };
+        process.stdin.once('data', keyHandler);
+        process.stdin.resume();
+    });
+}
+
+function showMenu() {
+    displayMenu();
+    
+    // Check if we're in a TTY environment
+    if (process.stdin.isTTY) {
+        // Set up raw mode for capturing arrow keys
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+        process.stdin.setEncoding('utf8');
+        
+        process.stdin.on('data', (key) => {
+            handleKeyPress(key);
+        });
+    } else {
+        // Fallback for non-TTY environments - use readline
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+        
+        console.log(colors.yellow + '  Arrow keys not available. Enter selection number (1-4): ' + colors.reset);
+        
+        rl.on('line', (input) => {
+            const choice = parseInt(input.trim());
+            if (choice >= 1 && choice <= mainMenuOptions.length) {
+                selectedIndex = choice - 1;
+                rl.close();
+                executeSelection();
+            } else if (input.toLowerCase() === 'q' || input.toLowerCase() === 'exit') {
+                rl.close();
+                console.log('');
+                console.log(colors.green + 'Goodbye!' + colors.reset);
+                process.exit(0);
+            } else {
+                console.log(colors.red + '  Invalid selection. Please enter 1-4.' + colors.reset);
+            }
+        });
+    }
+}
+
+// Handle process termination
+process.on('SIGINT', () => {
+    console.log('');
+    console.log(colors.green + 'Goodbye!' + colors.reset);
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('');
+    console.log(colors.green + 'Goodbye!' + colors.reset);
+    process.exit(0);
+});
+
+// Start application
+showMenu();
